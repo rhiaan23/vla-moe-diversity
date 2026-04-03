@@ -376,7 +376,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses, moe_loss_dict = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -390,14 +392,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        # Sum MoE auxiliary losses (tensors) for backprop, log scalars
+        moe_aux_total = torch.tensor(0.0, device=losses.device)
+        for k, v in moe_loss_dict.items():
+            if isinstance(v, torch.Tensor) and v.requires_grad:
+                moe_aux_total = moe_aux_total + v
+            loss_dict[k] = v.item() if isinstance(v, torch.Tensor) else v
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            loss = per_sample_loss.mean() + moe_aux_total
+            loss_dict["loss"] = loss.item()
+            return per_sample_loss + moe_aux_total / per_sample_loss.shape[0], loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = losses.mean() + moe_aux_total
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -568,7 +578,23 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            use_moe=self.config.use_moe,
+            moe_num_experts=self.config.moe_num_experts,
+            moe_top_k=self.config.moe_top_k,
+            moe_expert_intermediate_size=self.config.moe_expert_intermediate_size,
+            use_diversity_loss=self.config.use_diversity_loss,
         )
+
+        # Discriminator for diversity loss (Experiment B)
+        self.discriminator = None
+        if self.config.use_moe and self.config.use_diversity_loss:
+            from lerobot.policies.smolvla.moe import ExpertDiscriminator
+
+            self.discriminator = ExpertDiscriminator(
+                hidden_size=self.vlm_with_expert.expert_hidden_size,
+                num_experts=self.config.moe_num_experts,
+                disc_hidden_size=self.config.moe_disc_hidden_size,
+            )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
@@ -783,7 +809,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (_, suffix_out), _, moe_aux_data = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -796,7 +822,25 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+
+        # Aggregate MoE auxiliary losses
+        moe_loss_dict = {}
+        if self.config.use_moe and moe_aux_data:
+            lb_losses = [d["load_balance_loss"] for d in moe_aux_data]
+            moe_loss_dict["moe_lb_loss"] = torch.stack(lb_losses).mean() * self.config.moe_load_balance_weight
+
+            # Log mean router entropy and expert utilization
+            all_tokens_per_expert = torch.stack([d["tokens_per_expert"] for d in moe_aux_data]).mean(dim=0)
+            moe_loss_dict["moe_expert_utilization_std"] = all_tokens_per_expert.std()
+
+            if self.config.use_diversity_loss and self.discriminator is not None:
+                from lerobot.policies.smolvla.moe import compute_diversity_losses
+
+                diversity = compute_diversity_losses(moe_aux_data, self.discriminator)
+                moe_loss_dict["moe_orth_loss"] = diversity["orth_loss"] * self.config.moe_lambda_orth
+                moe_loss_dict["moe_disc_loss"] = diversity["disc_loss"] * self.config.moe_lambda_disc
+
+        return losses, moe_loss_dict
 
     def sample_actions(
         self,
@@ -822,7 +866,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        _, past_key_values, _ = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -890,7 +934,7 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
+        outputs_embeds, _, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,

@@ -71,6 +71,11 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_moe: bool = False,
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_expert_intermediate_size: int | None = 128,
+        use_diversity_loss: bool = False,
     ):
         super().__init__()
         if load_vlm_weights:
@@ -122,6 +127,21 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
+
+        # MoE: replace each expert layer's MLP with MoE layer
+        self.use_moe = use_moe
+        self.use_diversity_loss = use_diversity_loss
+        if use_moe:
+            from lerobot.policies.smolvla.moe import MoELayer
+
+            for layer in self.lm_expert.layers:
+                layer.mlp = MoELayer(
+                    hidden_size=lm_expert_config.hidden_size,
+                    num_experts=moe_num_experts,
+                    top_k=moe_top_k,
+                    original_mlp=layer.mlp,
+                    expert_intermediate_size=moe_expert_intermediate_size,
+                )
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
@@ -419,6 +439,9 @@ class SmolVLMWithExpertModel(nn.Module):
                 continue
             batch_size = hidden_states.shape[0]
 
+        # Collect MoE auxiliary losses across layers
+        moe_aux_data: list[dict] = []
+
         # RMSNorm
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
@@ -475,7 +498,20 @@ class SmolVLMWithExpertModel(nn.Module):
                     after_first_residual = out_emb.clone()
 
                     out_emb = layer.post_attention_layernorm(out_emb)
-                    out_emb = layer.mlp(out_emb)
+
+                    # MoE: expert layers (i=1) use MoE forward which returns aux data
+                    if self.use_moe and i == 1:
+                        from lerobot.policies.smolvla.moe import MoELayer
+
+                        if isinstance(layer.mlp, MoELayer):
+                            out_emb, moe_aux = layer.mlp(
+                                out_emb, collect_expert_outputs=self.use_diversity_loss
+                            )
+                            moe_aux_data.append(moe_aux)
+                        else:
+                            out_emb = layer.mlp(out_emb)
+                    else:
+                        out_emb = layer.mlp(out_emb)
 
                     out_emb += after_first_residual
 
@@ -495,7 +531,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)
-        return outputs_embeds, past_key_values
+        return outputs_embeds, past_key_values, moe_aux_data
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

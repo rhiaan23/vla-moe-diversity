@@ -103,6 +103,19 @@ class SmolVLAConfig(PreTrainedConfig):
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
+    # MoE configuration
+    use_moe: bool = False  # Replace action expert FFNs with Mixture-of-Experts
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_expert_intermediate_size: int = 256  # Per-expert FFN intermediate size (original is 1024; 256 keeps total params ~matched to baseline)
+    moe_load_balance_weight: float = 0.01
+
+    # Diversity losses (Experiment B: MoE + diversity objective)
+    use_diversity_loss: bool = False
+    moe_lambda_orth: float = 0.05  # Orthogonality loss weight
+    moe_lambda_disc: float = 0.02  # Discriminability loss weight
+    moe_disc_hidden_size: int = 128  # Discriminator MLP hidden size
+
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
