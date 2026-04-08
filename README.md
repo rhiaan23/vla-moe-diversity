@@ -29,7 +29,7 @@ ds = LeRobotDataset("lerobot/libero_10")
 
 ## Experiments
 
-There are three configs: baseline, standard MoE, and MoE with diversity loss.
+There are four configs: baseline, single-expert MoE, standard MoE, and MoE with diversity loss.
 
 ### Baseline (no MoE)
 
@@ -59,6 +59,26 @@ python -m lerobot.scripts.lerobot_train \
   --batch_size=32 \
   --steps=50000 \
   --output_dir=outputs/moe_standard \
+  --wandb.enable=true --wandb.project=vla-moe-diversity \
+  '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
+```
+
+### Experiment A0: Single-Expert MoE Ablation
+
+Uses the MoE codepath with exactly one expert, keeping the same per-expert size as the multi-expert runs. Since there is only one expert, routing uses `top_k=1`.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.path=checkpoints/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.use_moe=true \
+  --policy.use_diversity_loss=false \
+  --policy.moe_num_experts=1 \
+  --policy.moe_top_k=1 \
+  --dataset.repo_id=lerobot/libero_10 \
+  --batch_size=32 \
+  --steps=50000 \
+  --output_dir=outputs/moe_single_expert \
   --wandb.enable=true --wandb.project=vla-moe-diversity \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
 ```
