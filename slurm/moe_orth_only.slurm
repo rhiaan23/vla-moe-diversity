@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=pi0-moe-diversity
+#SBATCH --job-name=smolvla-moe-orth-only
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=gpu80
-#SBATCH --mem=384G
-#SBATCH --time=24:00:00
-#SBATCH --output=/scratch/network/rj2807/logs/pi0_moe_diversity_%j.out
-#SBATCH --error=/scratch/network/rj2807/logs/pi0_moe_diversity_%j.err
+#SBATCH --mem=64G
+#SBATCH --time=48:00:00
+#SBATCH --output=/scratch/network/rj2807/logs/moe_orth_only_%j.out
+#SBATCH --error=/scratch/network/rj2807/logs/moe_orth_only_%j.err
 
 mkdir -p /scratch/network/rj2807/logs
 
@@ -19,23 +19,18 @@ export TRANSFORMERS_OFFLINE=1
 
 source /scratch/network/rj2807/vla-moe-diversity/.venv/bin/activate
 
-rm -rf /scratch/network/rj2807/outputs/pi0_moe_diversity
-
 python -m lerobot.scripts.lerobot_train \
-  --policy.path=lerobot/pi0 \
-  --policy.device=cuda \
-  --policy.dtype=bfloat16 \
+  --policy.path=lerobot/smolvla_base \
   --policy.push_to_hub=false \
-  --policy.train_expert_only=true \
-  --policy.freeze_vision_encoder=true \
-  --policy.gradient_checkpointing=true \
   --policy.use_moe=true \
   --policy.use_diversity_loss=true \
+  --policy.moe_lambda_orth=0.05 \
+  --policy.moe_lambda_disc=0.0 \
   --dataset.repo_id=lerobot/libero_10 \
-  --batch_size=64 \
-  --num_workers=4 \
+  --batch_size=256 \
+  --num_workers=7 \
   --steps=50000 \
-  --output_dir=/scratch/network/rj2807/outputs/pi0_moe_diversity \
+  --output_dir=/scratch/network/rj2807/outputs/moe_orth_only \
   --wandb.enable=true \
   --wandb.mode=offline \
   --wandb.project=vla-moe-diversity \

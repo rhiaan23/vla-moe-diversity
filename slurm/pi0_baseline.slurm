@@ -28,6 +28,7 @@ python -m lerobot.scripts.lerobot_train \
   --policy.push_to_hub=false \
   --policy.train_expert_only=true \
   --policy.freeze_vision_encoder=true \
+  --policy.gradient_checkpointing=true \
   --dataset.repo_id=lerobot/libero_10 \
   --batch_size=64 \
   --num_workers=4 \

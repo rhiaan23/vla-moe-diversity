@@ -28,6 +28,7 @@ python -m lerobot.scripts.lerobot_train \
   --policy.push_to_hub=false \
   --policy.train_expert_only=true \
   --policy.freeze_vision_encoder=true \
+  --policy.gradient_checkpointing=true \
   --policy.use_moe=true \
   --policy.use_diversity_loss=false \
   --policy.moe_num_experts=1 \

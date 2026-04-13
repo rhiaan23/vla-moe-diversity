@@ -225,6 +225,39 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
+class _MoEAdapter(nn.Module):
+    """Drop-in adapter so `MoELayer` can replace a SwiGLU MLP inside the gemma expert.
+
+    `MoELayer.forward()` returns `(tensor, aux_dict)`. Both `compute_layer_complete()`
+    below and the standard HuggingFace Gemma decoder layer (used by the suffix-only
+    inference path via `gemma_expert.model.forward(...)`) call `layer.mlp(x)` and
+    expect a single tensor back. This adapter:
+
+    - returns just the tensor from `forward()`,
+    - stashes the latest aux dict on `self.last_aux` so the caller can collect it
+      after each layer (mirrors how SmolVLA appends to `moe_aux_data`),
+    - exposes the underlying first expert's `up_proj` so the dtype probe at
+      `compute_layer_complete` (`if layer.mlp.up_proj.weight.dtype == ...`) keeps
+      working without special-casing.
+    """
+
+    def __init__(self, moe_layer: nn.Module):
+        super().__init__()
+        self.moe_layer = moe_layer
+        self.last_aux: dict | None = None
+        self.collect_outputs: bool = False
+
+    @property
+    def up_proj(self):
+        # Delegate dtype-probe attribute access to the first expert.
+        return self.moe_layer.experts[0].up_proj
+
+    def forward(self, x: Tensor) -> Tensor:
+        out, aux = self.moe_layer(x, collect_expert_outputs=self.collect_outputs)
+        self.last_aux = aux
+        return out
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -349,12 +382,22 @@ class PaliGemmaWithExpertModel(
         image_size: int = DEFAULT_IMAGE_SIZE,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = False,
+        use_moe: bool = False,
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_expert_intermediate_size: int = 1024,
+        use_diversity_loss: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
+        self.use_moe = use_moe
+        self.use_diversity_loss = use_diversity_loss
+        # Latest collected MoE auxiliary dicts (one per expert layer); refreshed
+        # at the start of every forward() and read by PI0Pytorch.forward().
+        self._last_moe_aux_data: list[dict] = []
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -393,6 +436,22 @@ class PaliGemmaWithExpertModel(
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+
+        # MoE: replace each expert layer's MLP with an MoE layer wrapped in an
+        # adapter so it stays a tensor->tensor module from the caller's POV.
+        # Mirrors `smolvlm_with_expert.py:131-144`.
+        if use_moe:
+            from lerobot.policies.smolvla.moe import MoELayer
+
+            for layer in self.gemma_expert.model.layers:
+                moe_layer = MoELayer(
+                    hidden_size=action_expert_config.width,
+                    num_experts=moe_num_experts,
+                    top_k=moe_top_k,
+                    original_mlp=layer.mlp,
+                    expert_intermediate_size=moe_expert_intermediate_size,
+                )
+                layer.mlp = _MoEAdapter(moe_layer)
 
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
@@ -462,6 +521,17 @@ class PaliGemmaWithExpertModel(
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+
+        # Reset MoE auxiliary collection. The adapters write to .last_aux as a
+        # side effect during the per-layer forward; we read them back below.
+        # Mirrors how SmolVLA accumulates `moe_aux_data` (smolvlm_with_expert.py:443).
+        self._last_moe_aux_data = []
+        if self.use_moe:
+            for layer in self.gemma_expert.model.layers:
+                if isinstance(layer.mlp, _MoEAdapter):
+                    layer.mlp.last_aux = None
+                    layer.mlp.collect_outputs = self.use_diversity_loss
+
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -547,6 +617,15 @@ class PaliGemmaWithExpertModel(
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
+            # Collect MoE auxiliary outputs that the adapters stashed during
+            # `compute_layer_complete`. Only the joint forward path needs this
+            # (the prefix-only and suffix-only branches above are inference-time
+            # codepaths and don't backprop the auxiliary losses).
+            if self.use_moe:
+                for layer in self.gemma_expert.model.layers:
+                    if isinstance(layer.mlp, _MoEAdapter) and layer.mlp.last_aux is not None:
+                        self._last_moe_aux_data.append(layer.mlp.last_aux)
+
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
@@ -574,7 +653,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
+            use_moe=config.use_moe,
+            moe_num_experts=config.moe_num_experts,
+            moe_top_k=config.moe_top_k,
+            moe_expert_intermediate_size=config.moe_expert_intermediate_size,
+            use_diversity_loss=config.use_diversity_loss,
         )
+
+        # Discriminator for the diversity objective. Lives on PI0Pytorch (not
+        # PaliGemmaWithExpertModel) so it isn't frozen by `train_expert_only`.
+        # Mirrors `modeling_smolvla.py:588-597`.
+        self.discriminator = None
+        if config.use_moe and config.use_diversity_loss:
+            from lerobot.policies.smolvla.moe import ExpertDiscriminator
+
+            self.discriminator = ExpertDiscriminator(
+                hidden_size=action_expert_config.width,
+                num_experts=config.moe_num_experts,
+                disc_hidden_size=config.moe_disc_hidden_size,
+            )
 
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
@@ -624,6 +721,34 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+
+    def _aggregate_moe_losses(self, moe_aux_data: list[dict]) -> dict:
+        """Aggregate per-layer MoE auxiliary outputs into scalar loss tensors.
+
+        Mirrors the SmolVLA aggregation at `modeling_smolvla.py:826-841`. Returns
+        a dict of named loss tensors (and util scalars). Caller is responsible
+        for summing the trainable losses into the main loss.
+        """
+        moe_loss_dict: dict = {}
+        if not (self.config.use_moe and moe_aux_data):
+            return moe_loss_dict
+
+        lb_losses = [d["load_balance_loss"] for d in moe_aux_data]
+        moe_loss_dict["moe_lb_loss"] = (
+            torch.stack(lb_losses).mean() * self.config.moe_load_balance_weight
+        )
+
+        all_tokens_per_expert = torch.stack([d["tokens_per_expert"] for d in moe_aux_data]).mean(dim=0)
+        moe_loss_dict["moe_expert_utilization_std"] = all_tokens_per_expert.std()
+
+        if self.config.use_diversity_loss and self.discriminator is not None:
+            from lerobot.policies.smolvla.moe import compute_diversity_losses
+
+            diversity = compute_diversity_losses(moe_aux_data, self.discriminator)
+            moe_loss_dict["moe_orth_loss"] = diversity["orth_loss"] * self.config.moe_lambda_orth
+            moe_loss_dict["moe_disc_loss"] = diversity["disc_loss"] * self.config.moe_lambda_disc
+
+        return moe_loss_dict
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -796,6 +921,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
+        # Collect MoE auxiliary outputs that PaliGemmaWithExpertModel.forward
+        # stashed during the joint per-layer pass. Read here so the tensor refs
+        # still belong to the live autograd graph for backprop.
+        moe_aux_data = list(self.paligemma_with_expert._last_moe_aux_data)
+        moe_loss_dict = self._aggregate_moe_losses(moe_aux_data)
+
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
@@ -804,7 +935,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        return F.mse_loss(u_t, v_t, reduction="none"), moe_loss_dict
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1052,6 +1183,12 @@ class PI0Policy(PreTrainedPolicy):
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
+            # Free intermediate state dicts to recover ~32GB of CPU RAM
+            del original_state_dict, fixed_state_dict, remapped_state_dict
+            import gc
+
+            gc.collect()
+
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 5:
@@ -1291,7 +1428,9 @@ class PI0Policy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
 
         # Compute loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+        losses, moe_loss_dict = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1301,14 +1440,25 @@ class PI0Policy(PreTrainedPolicy):
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 
+        # Sum MoE auxiliary losses (tensors with grad) for backprop, log scalars
+        # for everything in moe_loss_dict. Mirrors `modeling_smolvla.py:395-411`.
+        moe_aux_total = torch.tensor(0.0, device=losses.device)
+        for k, v in moe_loss_dict.items():
+            if isinstance(v, torch.Tensor) and v.requires_grad:
+                moe_aux_total = moe_aux_total + v
+            loss_dict[k] = v.item() if isinstance(v, torch.Tensor) else v
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            total = per_sample_loss.mean() + moe_aux_total
+            loss_dict["loss"] = total.item()
+            # Spread the (scalar) aux total evenly across the batch dim so the
+            # caller's reduction still gives the right value.
+            return per_sample_loss + moe_aux_total / per_sample_loss.shape[0], loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = losses.mean() + moe_aux_total
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

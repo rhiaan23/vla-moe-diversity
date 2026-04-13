@@ -103,6 +103,36 @@ class PI0Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 48  # see openpi `__post_init__`
 
+    # MoE configuration (mirrors SmolVLAConfig). The action expert's per-layer
+    # SwiGLU MLP is replaced with `MoELayer(num_experts, top_k)` from
+    # `lerobot.policies.smolvla.moe`. Defaults match the SmolVLA matrix.
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    # gemma_300m action expert has mlp_dim=4096; 1024 keeps the per-expert SwiGLU
+    # roughly 1/4 the size of the original MLP so 8 experts ≈ 2× the params of
+    # the baseline MLP, comparable to the SmolVLA setup.
+    moe_expert_intermediate_size: int = 1024
+    moe_load_balance_weight: float = 0.01
+
+    # Diversity losses (orthogonality + discriminability) on top of standard MoE.
+    use_diversity_loss: bool = False
+    moe_lambda_orth: float = 0.05
+    moe_lambda_disc: float = 0.02
+    moe_disc_hidden_size: int = 128
+
+    # Deprecated fields kept for backward compatibility with pretrained checkpoint configs.
+    # These existed in earlier versions of the Pi0 config and are present in saved YAML files
+    # (e.g. lerobot/pi0_base). They are unused by current code.
+    resize_imgs_with_padding: list[int] | None = None
+    adapt_to_pi_aloha: bool = False
+    use_delta_joint_actions_aloha: bool = False
+    proj_width: int | None = None
+    num_steps: int | None = None
+    use_cache: bool = False
+    attention_implementation: str | None = None
+    train_state_proj: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
