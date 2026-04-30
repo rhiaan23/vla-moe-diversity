@@ -1,14 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=eval-pi0-baseline
+# LIBERO-Object generalization eval for pi0_moe_upcycled_v3_h100 on fisec RTX6000.
+# ADJUST the SBATCH header below to match your fisec cluster's conventions.
+#SBATCH --job-name=eval-gen-v3-object
+#SBATCH --account=fheide
+#SBATCH --partition=fisec
+#SBATCH --constraint=rtx_6000
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=gpu80
-#SBATCH --mem=256G
-#SBATCH --time=06:00:00
-#SBATCH --output=/scratch/gpfs/FHEIDE/rj2807/logs/eval_pi0_baseline_%j.out
-#SBATCH --error=/scratch/gpfs/FHEIDE/rj2807/logs/eval_pi0_baseline_%j.err
+#SBATCH --mem=128G
+#SBATCH --time=6:00:00
+#SBATCH --output=/scratch/gpfs/FHEIDE/rj2807/logs/eval_gen_v3_object_%j.out
+#SBATCH --error=/scratch/gpfs/FHEIDE/rj2807/logs/eval_gen_v3_object_%j.err
 
 mkdir -p /scratch/gpfs/FHEIDE/rj2807/logs
 
@@ -26,13 +30,13 @@ if [ -n "$ROBOSUITE_MACROS_PRIVATE" ] && [ ! -f "$ROBOSUITE_MACROS_PRIVATE" ]; t
 fi
 
 python -m lerobot.scripts.lerobot_eval \
-  --policy.path=/scratch/gpfs/FHEIDE/rj2807/outputs/pi0_baseline/checkpoints/last/pretrained_model \
+  --policy.path=/scratch/gpfs/FHEIDE/rj2807/outputs/pi0_moe_upcycled_v3_h100/checkpoints/last/pretrained_model \
   --env.type=libero \
-  --env.task=libero_10 \
-  --eval.batch_size=5 \
+  --env.task=libero_object \
+  --eval.batch_size=10 \
   --eval.n_episodes=50 \
   --policy.device=cuda \
-  --output_dir=/scratch/gpfs/FHEIDE/rj2807/outputs/evals/task_performance/pi0_baseline \
-  --job_name=eval_pi0_baseline \
+  --output_dir=/scratch/gpfs/FHEIDE/rj2807/outputs/evals_v3/moe_upcycled_v3/libero_object \
+  --job_name=eval_gen_v3_object \
   --seed=1000 \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.image2": "observation.images.camera2"}'

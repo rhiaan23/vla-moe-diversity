@@ -4,12 +4,12 @@
 
 set -euo pipefail
 
-export HF_HOME=/scratch/network/rj2807/cache/huggingface
-export HF_LEROBOT_HOME=/scratch/network/rj2807/lerobot_data
+export HF_HOME=/scratch/gpfs/FHEIDE/rj2807/cache/huggingface
+export HF_LEROBOT_HOME=/scratch/gpfs/FHEIDE/rj2807/lerobot_data
 mkdir -p "$HF_HOME" "$HF_LEROBOT_HOME"
 
 # Activate the project venv
-source /scratch/network/rj2807/vla-moe-diversity/.venv/bin/activate
+source /scratch/gpfs/FHEIDE/rj2807/vla-moe-diversity/.venv/bin/activate
 
 echo "=== Downloading SmolVLA base checkpoint ==="
 python -c "from huggingface_hub import snapshot_download; snapshot_download('lerobot/smolvla_base')"

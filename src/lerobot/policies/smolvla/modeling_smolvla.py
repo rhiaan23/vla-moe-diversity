@@ -593,6 +593,7 @@ class VLAFlowMatching(nn.Module):
             self.discriminator = ExpertDiscriminator(
                 hidden_size=self.vlm_with_expert.expert_hidden_size,
                 num_experts=self.config.moe_num_experts,
+                num_layers=self.vlm_with_expert.num_expert_layers,
                 disc_hidden_size=self.config.moe_disc_hidden_size,
             )
         self.state_proj = nn.Linear(

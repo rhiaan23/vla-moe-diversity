@@ -7,19 +7,19 @@
 #SBATCH --constraint=gpu80
 #SBATCH --mem=384G
 #SBATCH --time=24:00:00
-#SBATCH --output=/scratch/network/rj2807/logs/pi0_moe_standard_%j.out
-#SBATCH --error=/scratch/network/rj2807/logs/pi0_moe_standard_%j.err
+#SBATCH --output=/scratch/gpfs/FHEIDE/rj2807/logs/pi0_moe_standard_%j.out
+#SBATCH --error=/scratch/gpfs/FHEIDE/rj2807/logs/pi0_moe_standard_%j.err
 
-mkdir -p /scratch/network/rj2807/logs
+mkdir -p /scratch/gpfs/FHEIDE/rj2807/logs
 
-export HF_LEROBOT_HOME=/scratch/network/rj2807/lerobot_data
-export HF_HOME=/scratch/network/rj2807/cache/huggingface
+export HF_LEROBOT_HOME=/scratch/gpfs/FHEIDE/rj2807/lerobot_data
+export HF_HOME=/scratch/gpfs/FHEIDE/rj2807/cache/huggingface
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
-source /scratch/network/rj2807/vla-moe-diversity/.venv/bin/activate
+source /scratch/gpfs/FHEIDE/rj2807/vla-moe-diversity/.venv/bin/activate
 
-rm -rf /scratch/network/rj2807/outputs/pi0_moe_standard
+rm -rf /scratch/gpfs/FHEIDE/rj2807/outputs/pi0_moe_standard
 
 python -m lerobot.scripts.lerobot_train \
   --policy.path=lerobot/pi0 \
@@ -35,7 +35,7 @@ python -m lerobot.scripts.lerobot_train \
   --batch_size=64 \
   --num_workers=4 \
   --steps=50000 \
-  --output_dir=/scratch/network/rj2807/outputs/pi0_moe_standard \
+  --output_dir=/scratch/gpfs/FHEIDE/rj2807/outputs/pi0_moe_standard \
   --wandb.enable=true \
   --wandb.mode=offline \
   --wandb.project=vla-moe-diversity \

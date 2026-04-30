@@ -54,9 +54,34 @@ SLURM job scripts are in `slurm/`. Run with `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLI
 
 **Resubmission pitfall**: The training script raises `FileExistsError` if `--output_dir` already exists and `resume` is false (the default). Each slurm script includes `rm -rf <output_dir>` before the python command to clear stale output. Note: `--resume=true` does NOT work for fresh starts — WandB requires a previous run ID in the output dir, so it errors if the dir is missing or was cleaned. Only use `--resume=true` when genuinely resuming from an existing checkpoint.
 
-**Pi0 CPU RAM (OOM) pitfall**: Pi0 is a 4B param model (~16GB in CPU RAM). Each dataloader worker forks the main process, triggering copy-on-write page copies of the model. With `num_workers=7` this can consume 100GB+ of CPU RAM. Use `--mem=192G` and `--num_workers=4` for Pi0 jobs. Do not increase `num_workers` or `batch_size` without testing first.
+**Pi0 CPU RAM (OOM) pitfall**: Pi0 is a 4B param model (~16GB in CPU RAM). Each dataloader worker forks the main process, triggering copy-on-write page copies of the model. With `num_workers=7` this can consume 100GB+ of CPU RAM. Current Pi0 slurm scripts use `--mem=384G`, `--cpus-per-task=8`, `--num_workers=4`, `--batch_size=64` on a single `gpu80` A100. Do not raise `num_workers` or `batch_size` without testing.
 
-**Active Pi0 experiment variants** (the only ones to run): baseline, moe_single_expert, moe_standard, moe_diversity. The `orth_only` and `no_orth` ablations are not needed.
+**Pi0 required training flags**: every Pi0 slurm script sets `--policy.train_expert_only=true`, `--policy.freeze_vision_encoder=true`, `--policy.gradient_checkpointing=true`, `--policy.dtype=bfloat16`, and a `--rename_map` that maps LIBERO's `observation.images.{image,wrist_image}` to Pi0's expected `observation.images.{camera1,camera2}`. Copy these when creating new Pi0 jobs.
+
+**Active Pi0 experiment variants**: baseline, moe_single_expert, moe_standard, moe_diversity, **moe_orth_only**, **moe_diversity_no_orth**. The orth_only / no_orth ablations *are* priorities per `Project_Proposal.md` §4.3 — Kim (2026, arXiv:2601.00457) argues the orthogonality loss is ineffective, so ablating it is the main paper-framing experiment for the ICML 2026 Compositional Learning workshop (deadline 2026-04-24).
+
+### Della Cluster Specifics
+See `DELLA_INFO.md` for full hardware/QOS tables. Key points for this repo:
+- All GPU jobs use `#SBATCH --gres=gpu:1 --constraint=gpu80` (80GB A100). Pi0 won't fit on gpu40.
+- User queue is submitted via `sbatch slurm/<name>.slurm`; check with `squeue -u $USER`.
+- Outputs go to `/scratch/gpfs/FHEIDE/rj2807/outputs/<run_name>/`; slurm logs to `/scratch/gpfs/FHEIDE/rj2807/logs/`.
+
+### Offline Caching (compute nodes have no internet)
+Compute nodes on Della cannot reach HuggingFace. Every slurm script exports:
+```bash
+export HF_LEROBOT_HOME=/scratch/gpfs/FHEIDE/rj2807/lerobot_data
+export HF_HOME=/scratch/gpfs/FHEIDE/rj2807/cache/huggingface
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+Run `bash slurm/setup_cache.sh` on a login node (or `della-vis1`) once to pre-fetch `lerobot/smolvla_base`, `lerobot/pi0`, `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`, and `lerobot/libero_10`. The script also symlinks the snapshot into `$HF_LEROBOT_HOME/lerobot/libero_10` — without this, `LeRobotDataset` hits a revision-resolve network call and fails under `HF_HUB_OFFLINE=1`.
+
+### Slurm Script Families (in `slurm/`)
+Four patterns, one script per experiment variant:
+- **Train**: `{smolvla-prefix-less}.slurm` (e.g. `baseline.slurm`, `moe_diversity.slurm`) and `pi0_*.slurm`.
+- **`eval_task_perf_*.slurm`** — in-distribution LIBERO-10 success rate for trained checkpoints.
+- **`eval_gen_*.slurm`** (split by `goal` / `object` / `spatial`) — zero-shot generalization on held-out LIBERO task suites.
+- **`finetune_gen_*.slurm`** — few-shot adaptation runs on new LIBERO tasks; powers the "diversity-aware MoE adapts faster" hypothesis that drives the workshop paper.
 
 ## Architecture
 

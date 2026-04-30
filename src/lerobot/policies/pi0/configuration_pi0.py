@@ -112,14 +112,56 @@ class PI0Config(PreTrainedConfig):
     # gemma_300m action expert has mlp_dim=4096; 1024 keeps the per-expert SwiGLU
     # roughly 1/4 the size of the original MLP so 8 experts ≈ 2× the params of
     # the baseline MLP, comparable to the SmolVLA setup.
-    moe_expert_intermediate_size: int = 1024
+    # Only used when use_lora_experts=false AND moe_expert_intermediate_size is not None.
+    moe_expert_intermediate_size: int | None = 1024
     moe_load_balance_weight: float = 0.01
+    # Std of Gaussian noise added to each expert's parameters at sparse-upcycling
+    # init (see moe.MoELayer). 0.01 keeps experts near-clones; 0.1 breaks
+    # symmetry harder so the discriminator + router actually have something to
+    # latch onto early in training.
+    moe_init_noise: float = 0.01
+
+    # LoRA-MoE: each expert = frozen pretrained FFN + per-expert LoRA delta.
+    # When true, ignores moe_expert_intermediate_size and preserves pretrained init.
+    use_lora_experts: bool = False
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+    lora_dropout: float = 0.0
+
+    # Whole-expert MoE: N LoRA-adapted action experts share a frozen base FFN,
+    # but the SAME expert index is chosen for a given sample across ALL layers
+    # (sample-level routing). Implies LoRA experts. Diversity loss switches to
+    # functional orthogonality on LoRA delta directions instead of the
+    # per-layer expert-output discriminator.
+    moe_whole_expert: bool = False
+    # When moe_whole_expert=true, choose the per-expert capacity:
+    #   false → "lora" experts (frozen base + per-expert LoRA delta)
+    #   true  → "sparse" experts (deep-copies of pretrained MLP + init noise)
+    # Sparse mode combines v5's sample-level routing (proven task-conditional)
+    # with v3's full-FFN capacity (proven to retain task success).
+    moe_whole_expert_use_sparse: bool = False
+    # Router input source. "prefix_state" = mean-pooled embedded prefix
+    # (image patches + language tokens) concatenated with the projected
+    # state vector — the cheapest signal that includes vision.
+    moe_router_input: str = "prefix_state"
+    # Router architecture (deeper than a single linear so it can learn
+    # non-linear skill boundaries).
+    moe_router_hidden_size: int = 256
+    moe_router_num_layers: int = 3
+    # Number of random probe vectors used by the LoRA orthogonality loss.
+    moe_lora_orth_probes: int = 64
 
     # Diversity losses (orthogonality + discriminability) on top of standard MoE.
     use_diversity_loss: bool = False
     moe_lambda_orth: float = 0.05
     moe_lambda_disc: float = 0.02
     moe_disc_hidden_size: int = 128
+
+    # Task-supervised router CE: forces task-conditional routing by training
+    # the router to map task_id mod num_experts to the chosen expert. Empirical
+    # evidence (v6/v7) shows pure-BC diversity loss cannot drive task-conditional
+    # routing on its own; this provides the missing supervision signal.
+    moe_lambda_router_task_ce: float = 0.0
 
     # Deprecated fields kept for backward compatibility with pretrained checkpoint configs.
     # These existed in earlier versions of the Pi0 config and are present in saved YAML files

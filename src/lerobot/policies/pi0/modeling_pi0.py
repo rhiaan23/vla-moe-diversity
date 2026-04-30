@@ -246,16 +246,69 @@ class _MoEAdapter(nn.Module):
         self.moe_layer = moe_layer
         self.last_aux: dict | None = None
         self.collect_outputs: bool = False
+        # In LoRA mode, pretrained Pi0 checkpoint keys (e.g. `...mlp.gate_proj.weight`)
+        # need to be remapped to the MoE's shared frozen base FFN path
+        # (`...mlp.moe_layer.base_mlp.gate_proj.weight`) at load time. Without this,
+        # strict=False loading silently leaves base_mlp random-init.
+        if getattr(moe_layer, "use_lora_experts", False):
+            self._register_load_state_dict_pre_hook(self._remap_pretrained_mlp_keys)
+
+    @staticmethod
+    def _remap_pretrained_mlp_keys(
+        state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            old_key = f"{prefix}{proj}.weight"
+            new_key = f"{prefix}moe_layer.base_mlp.{proj}.weight"
+            if old_key in state_dict and new_key not in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
 
     @property
     def up_proj(self):
-        # Delegate dtype-probe attribute access to the first expert.
+        # Delegate dtype-probe attribute access. In LoRA mode, experts carry LoRA
+        # A/B only (no up_proj attr), so fall through to the shared base FFN.
+        if getattr(self.moe_layer, "use_lora_experts", False):
+            return self.moe_layer.base_mlp.up_proj
         return self.moe_layer.experts[0].up_proj
 
     def forward(self, x: Tensor) -> Tensor:
         out, aux = self.moe_layer(x, collect_expert_outputs=self.collect_outputs)
         self.last_aux = aux
         return out
+
+
+class _WholeExpertMLPAdapter(nn.Module):
+    """Tensor->tensor wrapper around `WholeExpertMoELayer`.
+
+    Expert-routing decisions live on the wrapped module (set externally
+    by the parent model before each forward), so this adapter only has to
+    pass tensors through. Exposes `up_proj` like the original MLP so the
+    dtype probe in `compute_layer_complete` keeps working.
+    """
+
+    def __init__(self, we_layer: nn.Module):
+        super().__init__()
+        self.we_layer = we_layer
+        self._register_load_state_dict_pre_hook(self._remap_pretrained_mlp_keys)
+
+    @staticmethod
+    def _remap_pretrained_mlp_keys(
+        state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # Pretrained checkpoint stores ...mlp.{gate,up,down}_proj.weight; remap to
+        # the shared frozen base inside the WholeExpertMoELayer.
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            old_key = f"{prefix}{proj}.weight"
+            new_key = f"{prefix}we_layer.base_mlp.{proj}.weight"
+            if old_key in state_dict and new_key not in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
+
+    @property
+    def up_proj(self):
+        return self.we_layer.base_mlp.up_proj
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.we_layer(x)
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -385,8 +438,15 @@ class PaliGemmaWithExpertModel(
         use_moe: bool = False,
         moe_num_experts: int = 8,
         moe_top_k: int = 2,
-        moe_expert_intermediate_size: int = 1024,
+        moe_expert_intermediate_size: int | None = 1024,
         use_diversity_loss: bool = False,
+        use_lora_experts: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: float = 32.0,
+        lora_dropout: float = 0.0,
+        moe_whole_expert: bool = False,
+        moe_init_noise: float = 0.01,
+        moe_whole_expert_use_sparse: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -395,6 +455,8 @@ class PaliGemmaWithExpertModel(
         self.train_expert_only = train_expert_only
         self.use_moe = use_moe
         self.use_diversity_loss = use_diversity_loss
+        self.moe_whole_expert = moe_whole_expert
+        self.moe_whole_expert_use_sparse = moe_whole_expert_use_sparse
         # Latest collected MoE auxiliary dicts (one per expert layer); refreshed
         # at the start of every forward() and read by PI0Pytorch.forward().
         self._last_moe_aux_data: list[dict] = []
@@ -440,8 +502,29 @@ class PaliGemmaWithExpertModel(
         # MoE: replace each expert layer's MLP with an MoE layer wrapped in an
         # adapter so it stays a tensor->tensor module from the caller's POV.
         # Mirrors `smolvlm_with_expert.py:131-144`.
-        if use_moe:
+        self.whole_expert_layers: list = []  # populated below if moe_whole_expert
+        if use_moe and moe_whole_expert:
+            from lerobot.policies.smolvla.moe import WholeExpertMoELayer
+
+            expert_type = "sparse" if moe_whole_expert_use_sparse else "lora"
+            for layer in self.gemma_expert.model.layers:
+                we_layer = WholeExpertMoELayer(
+                    base_mlp=layer.mlp,
+                    num_experts=moe_num_experts,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    expert_type=expert_type,
+                    init_noise=moe_init_noise,
+                )
+                layer.mlp = _WholeExpertMLPAdapter(we_layer)
+                self.whole_expert_layers.append(we_layer)
+        elif use_moe:
             from lerobot.policies.smolvla.moe import MoELayer
+
+            # LoRA mode preserves the pretrained FFN by sharing a frozen reference
+            # across all experts; intermediate-size shrink is mutually exclusive.
+            effective_intermediate_size = None if use_lora_experts else moe_expert_intermediate_size
 
             for layer in self.gemma_expert.model.layers:
                 moe_layer = MoELayer(
@@ -449,7 +532,12 @@ class PaliGemmaWithExpertModel(
                     num_experts=moe_num_experts,
                     top_k=moe_top_k,
                     original_mlp=layer.mlp,
-                    expert_intermediate_size=moe_expert_intermediate_size,
+                    expert_intermediate_size=effective_intermediate_size,
+                    use_lora_experts=use_lora_experts,
+                    lora_rank=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    init_noise=moe_init_noise,
                 )
                 layer.mlp = _MoEAdapter(moe_layer)
 
@@ -509,6 +597,16 @@ class PaliGemmaWithExpertModel(
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.embed_tokens(tokens)
+
+    def set_whole_expert_routing(self, indices: torch.Tensor, weights: torch.Tensor) -> None:
+        """Broadcast a (B, k) per-sample expert assignment to every layer.
+
+        Called by `PI0Pytorch` once per forward pass when whole-expert MoE is
+        enabled, so the same expert index is used across all layers for a
+        given sample.
+        """
+        for layer in self.whole_expert_layers:
+            layer.set_routing(indices, weights)
 
     def forward(
         self,
@@ -658,18 +756,43 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             moe_top_k=config.moe_top_k,
             moe_expert_intermediate_size=config.moe_expert_intermediate_size,
             use_diversity_loss=config.use_diversity_loss,
+            use_lora_experts=config.use_lora_experts,
+            lora_rank=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            moe_whole_expert=config.moe_whole_expert,
+            moe_init_noise=config.moe_init_noise,
+            moe_whole_expert_use_sparse=config.moe_whole_expert_use_sparse,
         )
 
-        # Discriminator for the diversity objective. Lives on PI0Pytorch (not
-        # PaliGemmaWithExpertModel) so it isn't frozen by `train_expert_only`.
-        # Mirrors `modeling_smolvla.py:588-597`.
+        # Diversity head: either the per-layer expert-output discriminator
+        # (standard MoE-FFN mode) or the global whole-expert router (whole-
+        # expert mode). Both live on PI0Pytorch so they aren't frozen by
+        # `train_expert_only`. Mirrors `modeling_smolvla.py:588-597`.
         self.discriminator = None
-        if config.use_moe and config.use_diversity_loss:
+        self.whole_expert_router = None
+        self._last_router_aux: dict | None = None
+        if config.use_moe and config.moe_whole_expert:
+            from lerobot.policies.smolvla.moe import WholeExpertRouter
+
+            # Router input: mean-pooled embedded prefix (image patches +
+            # language tokens, both at paligemma_config.width) plus the
+            # projected state vector (action_expert_config.width).
+            router_in_dim = paligemma_config.width + action_expert_config.width
+            self.whole_expert_router = WholeExpertRouter(
+                input_dim=router_in_dim,
+                num_experts=config.moe_num_experts,
+                top_k=config.moe_top_k,
+                hidden_size=config.moe_router_hidden_size,
+                num_layers=config.moe_router_num_layers,
+            )
+        elif config.use_moe and config.use_diversity_loss:
             from lerobot.policies.smolvla.moe import ExpertDiscriminator
 
             self.discriminator = ExpertDiscriminator(
                 hidden_size=action_expert_config.width,
                 num_experts=config.moe_num_experts,
+                num_layers=action_expert_config.depth,
                 disc_hidden_size=config.moe_disc_hidden_size,
             )
 
@@ -722,6 +845,36 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
+    def _route_whole_experts(self, prefix_embs, prefix_pad_masks, state) -> None:
+        """Run the global router and broadcast its decision to every layer.
+
+        Router input: mean-pooled embedded prefix (image patches + language
+        token embeddings, both produced by `embed_prefix` before the
+        transformer runs) concatenated with the projected state vector. Pi0's
+        vision tower is frozen, so the embedded image features are a
+        sufficient "what's in the scene" signal without re-running the VLM.
+        Stashes the router aux dict on `self._last_router_aux` for the loss
+        aggregator to read.
+        """
+        if self.whole_expert_router is None:
+            self._last_router_aux = None
+            return
+        # Mean-pool prefix tokens over the valid (pad-mask) positions.
+        mask = prefix_pad_masks.float().unsqueeze(-1)
+        pooled_prefix = (prefix_embs.float() * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+        if self.state_proj.weight.dtype == torch.float32:
+            state_in = state.to(torch.float32)
+        else:
+            state_in = state
+        state_emb = self.state_proj(state_in).float()
+        ctx = torch.cat([pooled_prefix, state_emb], dim=-1)
+        idx, wts, aux = self.whole_expert_router(ctx)
+        # Cast weights to expert dtype so per-sample dispatch math stays consistent.
+        expert_dtype = next(self.paligemma_with_expert.gemma_expert.parameters()).dtype
+        wts_cast = wts.to(expert_dtype)
+        self.paligemma_with_expert.set_whole_expert_routing(idx, wts_cast)
+        self._last_router_aux = aux
+
     def _aggregate_moe_losses(self, moe_aux_data: list[dict]) -> dict:
         """Aggregate per-layer MoE auxiliary outputs into scalar loss tensors.
 
@@ -730,7 +883,39 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         for summing the trainable losses into the main loss.
         """
         moe_loss_dict: dict = {}
-        if not (self.config.use_moe and moe_aux_data):
+        if not self.config.use_moe:
+            return moe_loss_dict
+
+        # Whole-expert mode: aux comes from the global router (set by
+        # _route_whole_experts) plus a parameter-space LoRA orth loss. Per-
+        # layer aux from the FFN-MoE path is not produced.
+        if self.config.moe_whole_expert:
+            if self._last_router_aux is None:
+                return moe_loss_dict
+            aux = self._last_router_aux
+            moe_loss_dict["moe_lb_loss"] = (
+                aux["load_balance_loss"] * self.config.moe_load_balance_weight
+            )
+            moe_loss_dict["moe_expert_utilization_std"] = aux["tokens_per_expert"].std()
+
+            # LoRA-mode-only diversity loss: probes ex.gate_A/gate_B which don't
+            # exist on sparse experts. v5 (LoRA whole-expert) showed routing
+            # specializes by task without this loss anyway, so for sparse we
+            # rely on routing dynamics + sparse-upcycling init noise alone.
+            if (
+                self.config.use_diversity_loss
+                and not self.config.moe_whole_expert_use_sparse
+            ):
+                from lerobot.policies.smolvla.moe import compute_lora_orthogonality_loss
+
+                orth = compute_lora_orthogonality_loss(
+                    self.paligemma_with_expert.whole_expert_layers,
+                    n_probes=self.config.moe_lora_orth_probes,
+                )
+                moe_loss_dict["moe_orth_loss"] = orth * self.config.moe_lambda_orth
+            return moe_loss_dict
+
+        if not moe_aux_data:
             return moe_loss_dict
 
         lb_losses = [d["load_balance_loss"] for d in moe_aux_data]
@@ -740,6 +925,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         all_tokens_per_expert = torch.stack([d["tokens_per_expert"] for d in moe_aux_data]).mean(dim=0)
         moe_loss_dict["moe_expert_utilization_std"] = all_tokens_per_expert.std()
+
+        task_router_ces = [d["task_router_ce"] for d in moe_aux_data if "task_router_ce" in d]
+        if task_router_ces and self.config.moe_lambda_router_task_ce > 0.0:
+            moe_loss_dict["moe_router_task_ce"] = (
+                torch.stack(task_router_ces).mean() * self.config.moe_lambda_router_task_ce
+            )
 
         if self.config.use_diversity_loss and self.discriminator is not None:
             from lerobot.policies.smolvla.moe import compute_diversity_losses
@@ -891,6 +1082,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
+        # Whole-expert MoE: pick top-k experts per sample once for the whole
+        # action-expert forward, so the same expert index is used at every layer.
+        self._route_whole_experts(prefix_embs, prefix_pad_masks, state)
+
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -981,6 +1176,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        # Whole-expert MoE: route once for the whole denoising loop. Same
+        # expert assignment is reused across every diffusion step.
+        self._route_whole_experts(prefix_embs, prefix_pad_masks, state)
 
         dt = -1.0 / num_steps
 
@@ -1427,10 +1626,18 @@ class PI0Policy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
-        # Compute loss
-        losses, moe_loss_dict = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions
-        )
+        # Make per-batch task_index visible to MoELayer.forward via contextvar.
+        # Used only when moe_lambda_router_task_ce > 0 (see moe.py).
+        from lerobot.policies.smolvla.moe import set_current_task_index
+
+        task_idx = batch.get("task_index", None)
+        set_current_task_index(task_idx)
+        try:
+            losses, moe_loss_dict = self.model.forward(
+                images, img_masks, lang_tokens, lang_masks, state, actions
+            )
+        finally:
+            set_current_task_index(None)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
