@@ -1,0 +1,18 @@
+[
+  {"name": "phase_t5_on_t8", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [8]},
+  {"name": "phase_t5_on_t9", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [9]},
+  {"name": "phase_t5_on_t3", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [3]},
+
+  {"name": "phase_t5_on_t0", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [0]},
+  {"name": "phase_t5_on_t6", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [6]},
+
+  {"name": "single_e1_t8", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [8]},
+  {"name": "single_e1_t9", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [9]},
+  {"name": "single_e1_t0", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [0]},
+  {"name": "single_e1_t6", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [6]},
+
+  {"name": "single_e8_t8", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [8]},
+  {"name": "single_e8_t9", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [9]},
+  {"name": "single_e8_t0", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [0]},
+  {"name": "single_e8_t6", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [6]}
+]

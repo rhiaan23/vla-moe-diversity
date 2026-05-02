@@ -1,0 +1,8 @@
+[
+  {"name": "phase_t5_on_libero_goal_t0", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_goal", "task_ids": [0]},
+  {"name": "phase_t5_on_libero_goal_t1", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_goal", "task_ids": [1]},
+  {"name": "single_e1_libero_goal_t0", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_goal", "task_ids": [0]},
+  {"name": "single_e1_libero_goal_t1", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_goal", "task_ids": [1]},
+  {"name": "passthrough_libero_goal_t0", "manual_mode": "passthrough", "env_task": "libero_goal", "task_ids": [0]},
+  {"name": "passthrough_libero_goal_t1", "manual_mode": "passthrough", "env_task": "libero_goal", "task_ids": [1]}
+]

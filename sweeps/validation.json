@@ -1,0 +1,15 @@
+[
+  {
+    "name": "validate_replay_t5_ep0",
+    "manual_mode": "scripted",
+    "manual_program": "programs/replay_success_t5_ep0.json",
+    "env_task": "libero_10",
+    "task_ids": [5]
+  },
+  {
+    "name": "validate_passthrough_t5",
+    "manual_mode": "passthrough",
+    "env_task": "libero_10",
+    "task_ids": [5]
+  }
+]

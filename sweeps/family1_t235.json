@@ -1,0 +1,42 @@
+[
+  {"name": "passthrough_t2", "manual_mode": "passthrough", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "passthrough_t3", "manual_mode": "passthrough", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "passthrough_t5", "manual_mode": "passthrough", "env_task": "libero_10", "task_ids": [5]},
+
+  {"name": "random_t2", "manual_mode": "random", "manual_random_seed": 42, "env_task": "libero_10", "task_ids": [2]},
+  {"name": "random_t3", "manual_mode": "random", "manual_random_seed": 42, "env_task": "libero_10", "task_ids": [3]},
+  {"name": "random_t5", "manual_mode": "random", "manual_random_seed": 42, "env_task": "libero_10", "task_ids": [5]},
+
+  {"name": "single_e1_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e5_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e5.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e8_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e9_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e9.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e11_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e11.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e15_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e15.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "single_e3_t2", "manual_mode": "scripted", "manual_program": "programs/single_expert_e3.json", "env_task": "libero_10", "task_ids": [2]},
+
+  {"name": "single_e1_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e5_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e5.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e8_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e9_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e9.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e11_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e11.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e15_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e15.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "single_e3_t3", "manual_mode": "scripted", "manual_program": "programs/single_expert_e3.json", "env_task": "libero_10", "task_ids": [3]},
+
+  {"name": "single_e1_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e1.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e5_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e5.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e8_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e8.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e9_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e9.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e11_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e11.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e15_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e15.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "single_e3_t5", "manual_mode": "scripted", "manual_program": "programs/single_expert_e3.json", "env_task": "libero_10", "task_ids": [5]},
+
+  {"name": "phase_t5_approach_then_transport", "manual_mode": "scripted", "manual_program": "programs/phase_t5_approach_then_transport.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "phase_t5_reversed", "manual_mode": "scripted", "manual_program": "programs/phase_t5_reversed.json", "env_task": "libero_10", "task_ids": [5]},
+  {"name": "phase_t2_approach_then_mix", "manual_mode": "scripted", "manual_program": "programs/phase_t2_approach_then_mix.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "phase_t2_reversed", "manual_mode": "scripted", "manual_program": "programs/phase_t2_reversed.json", "env_task": "libero_10", "task_ids": [2]},
+
+  {"name": "replay_t2_ep0_on_t2", "manual_mode": "scripted", "manual_program": "programs/replay_success_t2_ep0.json", "env_task": "libero_10", "task_ids": [2]},
+  {"name": "replay_t3_ep1_on_t3", "manual_mode": "scripted", "manual_program": "programs/replay_success_t3_ep1.json", "env_task": "libero_10", "task_ids": [3]},
+  {"name": "replay_t5_ep0_on_t5", "manual_mode": "scripted", "manual_program": "programs/replay_success_t5_ep0.json", "env_task": "libero_10", "task_ids": [5]}
+]
