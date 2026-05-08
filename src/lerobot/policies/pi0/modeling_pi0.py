@@ -311,6 +311,143 @@ class _WholeExpertMLPAdapter(nn.Module):
         return self.we_layer(x)
 
 
+class PrefixBottleneckProjector(nn.Module):
+    """Compresses the pooled prefix to a low-dim ``z`` and synthesizes per-layer
+    K/V tokens that the action expert cross-attends to in place of the real
+    prefix. Net effect: the only prefix-side information any expert layer sees
+    is a deterministic function of ``z``.
+
+    - down MLP: pooled prefix (paligemma_width) -> hidden -> bottleneck_dim
+    - per-layer up: z -> ``num_tokens * num_kv_heads * head_dim`` for K and V
+      separately (one ``Linear`` pair per gemma_expert layer)
+    """
+
+    def __init__(
+        self,
+        prefix_dim: int,
+        bottleneck_dim: int,
+        hidden: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_tokens: int,
+        state_dim: int = 0,
+        down_num_layers: int = 2,
+        upkv_num_layers: int = 1,
+        upkv_hidden: int = 256,
+        zero_init_upkv: bool = False,
+    ) -> None:
+        super().__init__()
+        self.bottleneck_dim = bottleneck_dim
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.num_tokens = num_tokens
+        self.state_dim = state_dim
+        kv_dim = num_kv_heads * head_dim
+        in_dim = prefix_dim + state_dim
+        down_layers: list[nn.Module] = []
+        cur = in_dim
+        for _ in range(max(down_num_layers - 1, 0)):
+            down_layers.append(nn.Linear(cur, hidden))
+            down_layers.append(nn.GELU())
+            cur = hidden
+        down_layers.append(nn.Linear(cur, bottleneck_dim))
+        self.down = nn.Sequential(*down_layers)
+
+        def _build_up_mlp() -> nn.Sequential:
+            layers: list[nn.Module] = []
+            cur = bottleneck_dim
+            for _ in range(max(upkv_num_layers - 1, 0)):
+                layers.append(nn.Linear(cur, upkv_hidden))
+                layers.append(nn.GELU())
+                cur = upkv_hidden
+            final = nn.Linear(cur, num_tokens * kv_dim)
+            if zero_init_upkv:
+                nn.init.zeros_(final.weight)
+                if final.bias is not None:
+                    nn.init.zeros_(final.bias)
+            layers.append(final)
+            return nn.Sequential(*layers)
+
+        self.up_k = nn.ModuleList([_build_up_mlp() for _ in range(num_layers)])
+        self.up_v = nn.ModuleList([_build_up_mlp() for _ in range(num_layers)])
+
+    def project_z(self, pooled_prefix: Tensor, state_emb: Tensor | None = None) -> Tensor:
+        x = pooled_prefix.to(self.down[0].weight.dtype)
+        if self.state_dim > 0:
+            if state_emb is None:
+                raise ValueError("state_emb is required when state_dim > 0 (prefix_bottleneck_include_state)")
+            x = torch.cat([x, state_emb.to(x.dtype)], dim=-1)
+        return self.down(x)
+
+    def synth_layer_kv(self, z: Tensor, layer_idx: int) -> tuple[Tensor, Tensor]:
+        """Return (K, V) of shape ``(B, num_kv_heads, num_tokens, head_dim)``."""
+        bsz = z.shape[0]
+        k = self.up_k[layer_idx](z).view(bsz, self.num_tokens, self.num_kv_heads, self.head_dim)
+        v = self.up_v[layer_idx](z).view(bsz, self.num_tokens, self.num_kv_heads, self.head_dim)
+        return k.transpose(1, 2), v.transpose(1, 2)
+
+
+def compute_suffix_layer_with_synth_kv(
+    layer_idx,
+    suffix_embs,
+    attention_mask,
+    suffix_position_ids,
+    adarms_cond,
+    paligemma,
+    gemma_expert,
+    synth_k,
+    synth_v,
+):
+    """Suffix-only layer forward with synthetic prefix K/V injected.
+
+    ``synth_k``/``synth_v`` shape: ``(B, num_kv_heads, num_synth_tokens, head_dim)``.
+    Synth tokens are placed at conceptual position 0; RoPE is applied only to
+    the suffix slice of K (synth K is left un-rotated, which is equivalent to
+    RoPE at position 0 being identity).
+    """
+    layer = gemma_expert.model.layers[layer_idx]
+    suffix_hidden, gate = layernorm_forward(layer.input_layernorm, suffix_embs, adarms_cond)
+    input_shape = suffix_hidden.shape[:-1]
+    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+    q = layer.self_attn.q_proj(suffix_hidden).view(hidden_shape).transpose(1, 2)
+    k = layer.self_attn.k_proj(suffix_hidden).view(hidden_shape).transpose(1, 2)
+    v = layer.self_attn.v_proj(suffix_hidden).view(hidden_shape).transpose(1, 2)
+
+    dummy = torch.zeros(
+        q.shape[0], suffix_position_ids.shape[1], q.shape[-1], device=q.device, dtype=q.dtype
+    )
+    cos, sin = paligemma.model.language_model.rotary_emb(dummy, suffix_position_ids)
+    q, k = modeling_gemma.apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+    full_k = torch.cat([synth_k.to(k.dtype), k], dim=2)
+    full_v = torch.cat([synth_v.to(v.dtype), v], dim=2)
+
+    scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
+    att_output, _ = modeling_gemma.eager_attention_forward(
+        paligemma.model.language_model.layers[layer_idx].self_attn,
+        q,
+        full_k,
+        full_v,
+        attention_mask,
+        scaling,
+    )
+    head_dim = layer.self_attn.head_dim
+    att_output = att_output.reshape(q.shape[0], -1, 1 * 8 * head_dim)
+
+    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+    out_emb = layer.self_attn.o_proj(att_output)
+    out_emb = _gated_residual(suffix_embs, out_emb, gate)
+    after_first_residual = out_emb.clone()
+    out_emb, gate2 = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond)
+    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+        out_emb = out_emb.to(dtype=torch.bfloat16)
+    out_emb = layer.mlp(out_emb)
+    return _gated_residual(after_first_residual, out_emb, gate2)
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -726,6 +863,89 @@ class PaliGemmaWithExpertModel(
 
         return [prefix_output, suffix_output], prefix_past_key_values
 
+    def forward_with_bottleneck(
+        self,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_2d_masks_4d: torch.Tensor,
+        prefix_position_ids: torch.Tensor,
+        suffix_embs: torch.Tensor,
+        suffix_attention_mask_4d: torch.Tensor,
+        suffix_position_ids: torch.Tensor,
+        adarms_cond,
+        projector: "PrefixBottleneckProjector",
+        prefix_source: str = "image_lang",
+        lang_pad_mask: torch.Tensor | None = None,
+        state_emb: torch.Tensor | None = None,
+    ):
+        """Bottleneck path: action expert sees only K/V tokens projected from a
+        low-dim ``z``. Runs PaliGemma over prefix alone, pools the output, and
+        runs gemma_expert over suffix alone with per-layer synthetic K/V.
+        """
+        if adarms_cond is None:
+            adarms_cond = [None, None]
+
+        # Reset MoE aux as in the standard forward.
+        self._last_moe_aux_data = []
+        if self.use_moe:
+            for layer in self.gemma_expert.model.layers:
+                if isinstance(layer.mlp, _MoEAdapter):
+                    layer.mlp.last_aux = None
+                    layer.mlp.collect_outputs = self.use_diversity_loss
+
+        # 1) PaliGemma forward over prefix only. Force eager attention so the
+        # additive 4D mask (float32 0/-inf) is accepted regardless of bf16 Q dtype.
+        self.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        prefix_output = self.paligemma.model.language_model.forward(
+            inputs_embeds=prefix_embs,
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            use_cache=False,
+            adarms_cond=adarms_cond[0],
+        ).last_hidden_state  # (B, P, paligemma_width)
+
+        # 2) Pool over valid tokens. ``image_lang`` pools all valid prefix tokens;
+        # ``lang_only`` pools only the language tokens.
+        if prefix_source == "lang_only" and lang_pad_mask is not None:
+            mask = (prefix_pad_masks & lang_pad_mask).to(prefix_output.dtype).unsqueeze(-1)
+        else:
+            mask = prefix_pad_masks.to(prefix_output.dtype).unsqueeze(-1)
+        pooled = (prefix_output * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+
+        # 3) Project to z (optionally including projected state).
+        z = projector.project_z(pooled, state_emb=state_emb)  # (B, bottleneck_dim)
+
+        # 4) Layer-by-layer suffix forward with per-layer synthetic K/V.
+        num_layers = self.paligemma.config.text_config.num_hidden_layers
+        hidden_states = suffix_embs
+        for layer_idx in range(num_layers):
+            synth_k, synth_v = projector.synth_layer_kv(z, layer_idx)
+            hidden_states = compute_suffix_layer_with_synth_kv(
+                layer_idx=layer_idx,
+                suffix_embs=hidden_states,
+                attention_mask=suffix_attention_mask_4d,
+                suffix_position_ids=suffix_position_ids,
+                adarms_cond=adarms_cond[1],
+                paligemma=self.paligemma,
+                gemma_expert=self.gemma_expert,
+                synth_k=synth_k,
+                synth_v=synth_v,
+            )
+
+        # Final norm on suffix only.
+        suffix_output, _ = layernorm_forward(
+            self.gemma_expert.model.norm, hidden_states, adarms_cond[1]
+        )
+
+        # Collect MoE aux written by adapters during the per-layer pass.
+        if self.use_moe:
+            for layer in self.gemma_expert.model.layers:
+                if isinstance(layer.mlp, _MoEAdapter) and layer.mlp.last_aux is not None:
+                    self._last_moe_aux_data.append(layer.mlp.last_aux)
+
+        return suffix_output, z
+
 
 class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI0 PyTorch model."""
@@ -802,6 +1022,30 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
         self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
         self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        # Prefix bottleneck: projector kept in float32 (small, numerically
+        # sensitive). The synth K/V are cast to expert dtype at use time.
+        self.prefix_bottleneck_projector: PrefixBottleneckProjector | None = None
+        if config.prefix_bottleneck:
+            if config.prefix_bottleneck_source not in ("image_lang", "lang_only"):
+                raise ValueError(
+                    f"Invalid prefix_bottleneck_source: {config.prefix_bottleneck_source}"
+                )
+            self.prefix_bottleneck_projector = PrefixBottleneckProjector(
+                prefix_dim=paligemma_config.width,
+                bottleneck_dim=config.prefix_bottleneck_dim,
+                hidden=config.prefix_bottleneck_hidden,
+                num_layers=action_expert_config.depth,
+                num_kv_heads=action_expert_config.num_kv_heads,
+                head_dim=action_expert_config.head_dim,
+                num_tokens=config.prefix_bottleneck_num_tokens,
+                state_dim=action_expert_config.width if config.prefix_bottleneck_include_state else 0,
+                down_num_layers=config.prefix_bottleneck_num_layers,
+                upkv_num_layers=config.prefix_bottleneck_upkv_num_layers,
+                upkv_hidden=config.prefix_bottleneck_upkv_hidden,
+                zero_init_upkv=config.prefix_bottleneck_zero_init_upkv,
+            )
+        self._last_z: Tensor | None = None
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -1000,26 +1244,35 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
-        embs = []
-        pad_masks = []
-        att_masks = []
-
+    def _embed_state(self, state: Tensor) -> Tensor:
         if self.state_proj.weight.dtype == torch.float32:
             state = state.to(torch.float32)
 
-        def state_proj_func(state):
-            return self.state_proj(state)
+        def state_proj_func(s):
+            return self.state_proj(s)
 
-        state_emb = self._apply_checkpoint(state_proj_func, state)
-        embs.append(state_emb[:, None, :])
-        bsize = state_emb.shape[0]
-        device = state_emb.device
+        return self._apply_checkpoint(state_proj_func, state)
 
-        state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
-        att_masks += [1]
+    def embed_suffix(self, state, noisy_actions, timestep, *, include_state_token: bool = True):
+        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
+
+        With ``include_state_token=False`` (option-b bottleneck), the state
+        token is omitted from the suffix entirely — the action expert sees
+        only ``[action+time]`` tokens. Caller is responsible for routing
+        state info through ``project_z`` instead.
+        """
+        embs = []
+        pad_masks = []
+        att_masks = []
+        device = state.device
+        bsize = state.shape[0]
+
+        if include_state_token:
+            state_emb = self._embed_state(state)
+            embs.append(state_emb[:, None, :])
+            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=state_emb.device)
+            pad_masks.append(state_mask)
+            att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
@@ -1049,11 +1302,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         adarms_cond = None
 
         embs.append(action_time_emb)
-        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_dim = action_time_emb.shape[1]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
+        # State (when present) and first action both start a fresh attention block.
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
@@ -1062,6 +1315,186 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
+
+    def _build_bottleneck_masks(
+        self,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        suffix_pad_masks: Tensor,
+        suffix_att_masks: Tensor,
+        num_synth_tokens: int,
+    ):
+        """Build the prefix-only and suffix-only attention masks/position_ids
+        used by the bottleneck path. Synth tokens are appended at conceptual
+        positions [0..T-1] with mask_ar=0 so suffix queries can attend to them
+        regardless of suffix barriers.
+        """
+        bsize = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
+
+        # Prefix-only: standard self-attention over the full prefix.
+        prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Synth + suffix combined for the suffix-only attention.
+        synth_pad = torch.ones(bsize, num_synth_tokens, dtype=torch.bool, device=device)
+        synth_att = torch.zeros(
+            bsize, num_synth_tokens, dtype=suffix_att_masks.dtype, device=device
+        )
+        combined_pad = torch.cat([synth_pad, suffix_pad_masks], dim=1)
+        combined_att = torch.cat([synth_att, suffix_att_masks], dim=1)
+        combined_2d = make_att_2d_masks(combined_pad, combined_att)
+        # Suffix queries attend over (synth | suffix) keys.
+        suffix_attention_mask = combined_2d[:, num_synth_tokens:, :]
+        combined_position_ids = torch.cumsum(combined_pad, dim=1) - 1
+        suffix_position_ids = combined_position_ids[:, num_synth_tokens:]
+
+        return (
+            prefix_att_2d,
+            prefix_position_ids,
+            suffix_attention_mask,
+            suffix_position_ids,
+        )
+
+    def _apply_policy_input_dropout(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        lang_tokens: Tensor,
+        suffix_embs: Tensor,
+        include_state_token: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Run-A input dropout: per-sample, per-modality independent zeroing.
+
+        With probability ``policy_input_dropout``, zero out:
+          * the state token (first row of the suffix, when present)
+          * the image-patch positions of the prefix
+          * the language-token positions of the prefix
+
+        No-op outside training and when the dropout rate is 0.
+        """
+        p = self.config.policy_input_dropout
+        if p <= 0.0 or not self.training:
+            return prefix_embs, suffix_embs
+
+        bsize = prefix_embs.shape[0]
+        device = prefix_embs.device
+
+        # Use a *separate* RNG so we don't advance the global CUDA RNG state.
+        # The downstream model is wrapped with ``_apply_checkpoint`` using
+        # ``preserve_rng_state=False``; if our torch.rand() calls advanced the
+        # global state, any dropout/RNG inside the checkpointed forward would
+        # be recomputed against a different RNG during backward, producing
+        # mismatched activations and NaN gradients.
+        gen = getattr(self, "_input_dropout_gen", None)
+        if gen is None:
+            gen = torch.Generator(device=device)
+            # Seed once based on whatever the global RNG has, then never touch
+            # the global state again from this generator.
+            gen.manual_seed(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+            self._input_dropout_gen = gen
+
+        # Independent Bernoulli rolls per sample per modality. Math runs in
+        # float32 to avoid any bf16 numerical surprise; cast at multiply time.
+        drop_state = torch.rand(bsize, device=device, generator=gen) < p
+        drop_image = torch.rand(bsize, device=device, generator=gen) < p
+        drop_lang = torch.rand(bsize, device=device, generator=gen) < p
+
+        lang_mask = self._lang_pad_mask_in_prefix(prefix_pad_masks, lang_tokens)
+        img_mask = prefix_pad_masks & ~lang_mask
+
+        keep_per_pos = torch.ones_like(prefix_pad_masks, dtype=torch.float32)
+        img_keep_b = (~drop_image).to(torch.float32)[:, None]  # (B, 1)
+        lang_keep_b = (~drop_lang).to(torch.float32)[:, None]
+        keep_per_pos = torch.where(
+            img_mask, img_keep_b.expand_as(keep_per_pos), keep_per_pos
+        )
+        keep_per_pos = torch.where(
+            lang_mask, lang_keep_b.expand_as(keep_per_pos), keep_per_pos
+        )
+        prefix_embs = prefix_embs * keep_per_pos.unsqueeze(-1).to(prefix_embs.dtype)
+
+        if include_state_token:
+            # State token is the first row of the suffix (see embed_suffix).
+            # Build a (B, T, 1) per-token multiplier: state_keep at row 0, 1.0
+            # elsewhere. Functional multiply avoids in-place ops that can
+            # interact poorly with autograd / gradient checkpointing.
+            seq_len = suffix_embs.shape[1]
+            state_keep = (~drop_state).to(torch.float32)[:, None, None]  # (B, 1, 1)
+            ones_rest = torch.ones(
+                bsize, seq_len - 1, 1, dtype=torch.float32, device=device
+            )
+            state_factor = torch.cat([state_keep, ones_rest], dim=1)  # (B, T, 1)
+            suffix_embs = suffix_embs * state_factor.to(suffix_embs.dtype)
+
+        return prefix_embs, suffix_embs
+
+    def _lang_pad_mask_in_prefix(
+        self, prefix_pad_masks: Tensor, lang_tokens: Tensor
+    ) -> Tensor:
+        """Build a (B, P) mask True only at language-token positions of the prefix.
+
+        ``embed_prefix`` always lays out images first, then language tokens, so
+        the last ``lang_tokens.shape[1]`` columns of the prefix are language.
+        AND with ``prefix_pad_masks`` to mask out language padding.
+        """
+        prefix_len = prefix_pad_masks.shape[1]
+        num_lang = lang_tokens.shape[1]
+        out = torch.zeros_like(prefix_pad_masks)
+        out[:, prefix_len - num_lang :] = True
+        return out & prefix_pad_masks
+
+    def _forward_with_bottleneck(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        suffix_embs: Tensor,
+        suffix_pad_masks: Tensor,
+        suffix_att_masks: Tensor,
+        adarms_cond,
+        lang_tokens: Tensor,
+        state: Tensor | None = None,
+    ) -> Tensor:
+        """Build masks then call ``PaliGemmaWithExpertModel.forward_with_bottleneck``."""
+        T = self.config.prefix_bottleneck_num_tokens
+        (
+            prefix_att_2d,
+            prefix_position_ids,
+            suffix_attention_mask,
+            suffix_position_ids,
+        ) = self._build_bottleneck_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks, T
+        )
+        prefix_att_2d_4d = self._prepare_attention_masks_4d(prefix_att_2d)
+        suffix_attention_mask_4d = self._prepare_attention_masks_4d(suffix_attention_mask)
+
+        lang_pad_mask = None
+        if self.config.prefix_bottleneck_source == "lang_only":
+            lang_pad_mask = self._lang_pad_mask_in_prefix(prefix_pad_masks, lang_tokens)
+
+        state_emb = None
+        if self.config.prefix_bottleneck_include_state:
+            if state is None:
+                raise ValueError("state is required when prefix_bottleneck_include_state=True")
+            state_emb = self._embed_state(state)
+
+        suffix_out, z = self.paligemma_with_expert.forward_with_bottleneck(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_2d_masks_4d=prefix_att_2d_4d,
+            prefix_position_ids=prefix_position_ids,
+            suffix_embs=suffix_embs,
+            suffix_attention_mask_4d=suffix_attention_mask_4d,
+            suffix_position_ids=suffix_position_ids,
+            adarms_cond=[None, adarms_cond],
+            projector=self.prefix_bottleneck_projector,
+            prefix_source=self.config.prefix_bottleneck_source,
+            lang_pad_mask=lang_pad_mask,
+            state_emb=state_emb,
+        )
+        self._last_z = z.detach()
+        return suffix_out
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
@@ -1080,7 +1513,27 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        # Option-b bottleneck: omit the state token from the suffix; state
+        # info enters z via the projector instead. With
+        # ``prefix_bottleneck_keep_state_token`` the state token is kept as a
+        # residual pathway so the action expert sees state via both the
+        # pretrained suffix self-attn and the synth K/V from z.
+        include_state_token = (
+            (not (self.config.prefix_bottleneck and self.config.prefix_bottleneck_include_state))
+            or self.config.prefix_bottleneck_keep_state_token
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, time, include_state_token=include_state_token
+        )
+
+        # Run-A input dropout on (state token, image-prefix, lang-prefix).
+        prefix_embs, suffix_embs = self._apply_policy_input_dropout(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            lang_tokens=lang_tokens,
+            suffix_embs=suffix_embs,
+            include_state_token=include_state_token,
+        )
 
         # Whole-expert MoE: pick top-k experts per sample once for the whole
         # action-expert forward, so the same expert index is used at every layer.
@@ -1093,28 +1546,41 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
+        if self.config.prefix_bottleneck:
+            suffix_out = self._forward_with_bottleneck(
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_att_masks=prefix_att_masks,
+                suffix_embs=suffix_embs,
+                suffix_pad_masks=suffix_pad_masks,
+                suffix_att_masks=suffix_att_masks,
+                adarms_cond=adarms_cond,
+                lang_tokens=lang_tokens,
+                state=state,
             )
-            return suffix_out
+        else:
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+            def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+                (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                    attention_mask=att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, suffix_embs],
+                    use_cache=False,
+                    adarms_cond=[None, adarms_cond],
+                )
+                return suffix_out
+
+            suffix_out = self._apply_checkpoint(
+                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            )
 
         # Collect MoE auxiliary outputs that PaliGemmaWithExpertModel.forward
         # stashed during the joint per-layer pass. Read here so the tensor refs
@@ -1169,13 +1635,47 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        bottleneck_active = (
+            self.config.prefix_bottleneck and self.prefix_bottleneck_projector is not None
         )
+        cached_synth_kv: list[tuple[Tensor, Tensor]] | None = None
+        past_key_values = None
+
+        if bottleneck_active:
+            # Run paligemma over prefix once to compute the pooled feature, then
+            # cache per-layer synth K/V from z so each denoise step is suffix-only.
+            self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            prefix_output = self.paligemma_with_expert.paligemma.model.language_model.forward(
+                inputs_embeds=prefix_embs,
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                use_cache=False,
+            ).last_hidden_state
+            if self.config.prefix_bottleneck_source == "lang_only":
+                lang_pad_mask = self._lang_pad_mask_in_prefix(prefix_pad_masks, lang_tokens)
+                mask = (prefix_pad_masks & lang_pad_mask).to(prefix_output.dtype).unsqueeze(-1)
+            else:
+                mask = prefix_pad_masks.to(prefix_output.dtype).unsqueeze(-1)
+            pooled = (prefix_output * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-9)
+            state_emb_for_z = (
+                self._embed_state(state) if self.config.prefix_bottleneck_include_state else None
+            )
+            z = self.prefix_bottleneck_projector.project_z(pooled, state_emb=state_emb_for_z)
+            self._last_z = z.detach()
+            num_layers = self.paligemma_with_expert.paligemma.config.text_config.num_hidden_layers
+            cached_synth_kv = [
+                self.prefix_bottleneck_projector.synth_layer_kv(z, layer_idx)
+                for layer_idx in range(num_layers)
+            ]
+        else:
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         # Whole-expert MoE: route once for the whole denoising loop. Same
         # expert assignment is reused across every diffusion step.
@@ -1189,6 +1689,15 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+                if bottleneck_active:
+                    return self.denoise_step_bottleneck(
+                        state=state,
+                        prefix_pad_masks=prefix_pad_masks,
+                        prefix_att_masks=prefix_att_masks,
+                        cached_synth_kv=cached_synth_kv,
+                        x_t=input_x_t,
+                        timestep=current_timestep,
+                    )
                 return self.denoise_step(
                     state=state,
                     prefix_pad_masks=prefix_pad_masks,
@@ -1256,6 +1765,68 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)
+
+    def denoise_step_bottleneck(
+        self,
+        state,
+        prefix_pad_masks,
+        prefix_att_masks,
+        cached_synth_kv,
+        x_t,
+        timestep,
+    ):
+        """One denoising step using cached per-layer synth K/V from the bottleneck.
+
+        ``cached_synth_kv`` is a per-layer list of ``(K, V)`` tensors of shape
+        ``(B, num_kv_heads, num_synth_tokens, head_dim)`` — pre-computed once
+        per ``sample_actions`` call.
+        """
+        include_state_token = (
+            not self.config.prefix_bottleneck_include_state
+        ) or self.config.prefix_bottleneck_keep_state_token
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep, include_state_token=include_state_token
+        )
+
+        if (
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0]
+            .self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+        T = self.config.prefix_bottleneck_num_tokens
+        (
+            _prefix_att_2d,
+            _prefix_position_ids,
+            suffix_attention_mask,
+            suffix_position_ids,
+        ) = self._build_bottleneck_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks, T
+        )
+        suffix_attention_mask_4d = self._prepare_attention_masks_4d(suffix_attention_mask)
+
+        num_layers = self.paligemma_with_expert.paligemma.config.text_config.num_hidden_layers
+        hidden_states = suffix_embs
+        for layer_idx in range(num_layers):
+            synth_k, synth_v = cached_synth_kv[layer_idx]
+            hidden_states = compute_suffix_layer_with_synth_kv(
+                layer_idx=layer_idx,
+                suffix_embs=hidden_states,
+                attention_mask=suffix_attention_mask_4d,
+                suffix_position_ids=suffix_position_ids,
+                adarms_cond=adarms_cond,
+                paligemma=self.paligemma_with_expert.paligemma,
+                gemma_expert=self.paligemma_with_expert.gemma_expert,
+                synth_k=synth_k,
+                synth_v=synth_v,
+            )
+        suffix_out, _ = layernorm_forward(
+            self.paligemma_with_expert.gemma_expert.model.norm, hidden_states, adarms_cond
+        )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
@@ -1670,10 +2241,53 @@ class PI0Policy(PreTrainedPolicy):
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0 fine-tuning."""
+        """Return default PEFT target modules for PI0 fine-tuning.
+
+        Two regimes:
+
+        * ``lora_vlm=False`` (default): LoRA adapters target the action-expert
+          q/v projections and the small I/O heads. The base VLM is kept fully
+          frozen.
+        * ``lora_vlm=True``: LoRA adapters target the *PaliGemma VLM* text-
+          model q/v projections, and the whole-expert router + I/O heads are
+          listed under ``modules_to_save`` so they are trained full-rank.
+          The gemma_expert action transformer (self-attn, layer norms, and
+          the per-layer LoRA experts inside ``WholeExpertMoELayer``) stays
+          frozen — this is the "experts frozen, finetune router + VLM-LoRA"
+          recipe used to recompose pretrained MoE skills onto new tasks.
+        """
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
+        if self.config.lora_vlm:
+            target_modules = (
+                r".*\.paligemma\.model\.language_model\.layers\.\d+\.self_attn\.(q|v)_proj"
+            )
+            modules_to_save: list[str] = [
+                "state_proj",
+                "action_in_proj",
+                "action_out_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            ]
+            if self.config.use_moe and self.config.moe_whole_expert:
+                modules_to_save.append("whole_expert_router")
+                # Whole-expert LoRA experts live inside ``WholeExpertMoELayer``
+                # (named ``we_layer`` on each gemma_expert layer). Without
+                # adding them to ``modules_to_save``, PEFT freezes them and
+                # they stay at their random init.
+                modules_to_save.append("we_layer")
+            elif self.config.use_moe and self.config.use_diversity_loss:
+                modules_to_save.append("discriminator")
+            # Prefix bottleneck projector is added by us; PEFT freezes it by
+            # default since it's neither a target adapter nor in the original
+            # modules_to_save list.
+            if self.config.prefix_bottleneck:
+                modules_to_save.append("prefix_bottleneck_projector")
+            return {
+                "target_modules": target_modules,
+                "modules_to_save": modules_to_save,
+            }
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

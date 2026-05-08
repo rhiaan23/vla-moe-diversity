@@ -19,6 +19,7 @@ from typing import Any
 import draccus
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.envs.libero_instruction_presets import LIBERO_INSTRUCTION_PRESETS
 from lerobot.robots import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.constants import (
@@ -291,8 +292,18 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    # Overrides `task.language` passed to VLAs (`task_description`). Mutually exclusive with
+    # `instruction_preset`.
+    instruction_override: str | None = None
+    # Shortcut for `instruction_override`; keys are documented in libero_instruction_presets.py.
+    instruction_preset: str | None = None
 
     def __post_init__(self):
+        if self.instruction_preset is not None and self.instruction_override is not None:
+            raise ValueError("Use only one of `instruction_preset` or `instruction_override`.")
+        if self.instruction_preset is not None and self.instruction_preset not in LIBERO_INSTRUCTION_PRESETS:
+            opts = ", ".join(sorted(LIBERO_INSTRUCTION_PRESETS))
+            raise ValueError(f"Unknown `instruction_preset` {self.instruction_preset!r}. Options: {opts}")
         if self.obs_type == "pixels":
             self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
                 type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3)
@@ -343,6 +354,10 @@ class LiberoEnv(EnvConfig):
         kwargs: dict[str, Any] = {"obs_type": self.obs_type, "render_mode": self.render_mode}
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.instruction_override is not None:
+            kwargs["instruction_override"] = self.instruction_override
+        elif self.instruction_preset is not None:
+            kwargs["instruction_override"] = LIBERO_INSTRUCTION_PRESETS[self.instruction_preset]
         return kwargs
 
 

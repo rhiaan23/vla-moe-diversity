@@ -116,6 +116,7 @@ class LiberoEnv(gym.Env):
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
         control_mode: str = "relative",
+        instruction_override: str | None = None,
     ):
         super().__init__()
         self.task_id = task_id
@@ -142,6 +143,7 @@ class LiberoEnv(gym.Env):
             }
         self.camera_name_mapping = camera_name_mapping
         self.num_steps_wait = num_steps_wait
+        self.instruction_override = instruction_override
         self.episode_index = episode_index
         self.episode_length = episode_length
         # Load once and keep
@@ -150,7 +152,9 @@ class LiberoEnv(gym.Env):
 
         self.init_state_id = self.episode_index  # tie each sub-env to a fixed init state
 
-        self._env = self._make_envs_task(task_suite, self.task_id)
+        self._env = self._make_envs_task(
+            task_suite, self.task_id, instruction_override=self.instruction_override
+        )
         default_steps = 500
         self._max_episode_steps = (
             TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
@@ -227,10 +231,12 @@ class LiberoEnv(gym.Env):
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
-    def _make_envs_task(self, task_suite: Any, task_id: int = 0):
+    def _make_envs_task(
+        self, task_suite: Any, task_id: int = 0, instruction_override: str | None = None
+    ):
         task = task_suite.get_task(task_id)
         self.task = task.name
-        self.task_description = task.language
+        self.task_description = task.language if not instruction_override else instruction_override
         task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
 
         env_args = {

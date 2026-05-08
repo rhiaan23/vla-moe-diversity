@@ -163,6 +163,91 @@ class PI0Config(PreTrainedConfig):
     # routing on its own; this provides the missing supervision signal.
     moe_lambda_router_task_ce: float = 0.0
 
+    # LoRA fine-tuning of the (otherwise frozen) PaliGemma VLM. When True, the
+    # default PEFT targets are switched so that LoRA adapters are applied to
+    # the VLM text-model self-attention q/v projections, while the
+    # whole-expert router and the I/O heads (state_proj, action_*_proj,
+    # action_time_mlp_*) are placed in ``modules_to_save`` (i.e., trained
+    # full-rank). The action expert (gemma_expert) — including its self-
+    # attention, layernorms, and the per-layer LoRA experts inside
+    # ``WholeExpertMoELayer`` — stays frozen. Together this yields the
+    # "freeze experts, finetune router + VLM-LoRA" recipe.
+    # NOTE: this flag only takes effect if PEFT is also enabled, e.g. by
+    # passing ``--peft.method_type=LORA`` on the command line. Without that,
+    # the policy trains in the standard non-PEFT way.
+    lora_vlm: bool = False
+
+    # Post-load freezing knobs for the "router-only finetune" experiment, where
+    # the v5 LoRA experts are treated as fixed primitives and only the router
+    # is allowed to update. Both freeze passes run after make_policy + (any)
+    # PEFT wrap, so they take effect with or without PEFT.
+    # ``freeze_action_expert`` freezes the entire gemma_expert subtree
+    # (self-attn, layernorms, *and* every WholeExpertMoELayer + its LoRA
+    # experts), plus the discriminator if present.
+    freeze_action_expert: bool = False
+    # ``freeze_io_heads`` freezes state_proj, action_in_proj, action_out_proj,
+    # action_time_mlp_in, action_time_mlp_out so the only thing that moves is
+    # the whole_expert_router (assuming PaliGemma is already frozen via
+    # train_expert_only=True).
+    freeze_io_heads: bool = False
+
+    # Prefix bottleneck: replace the per-layer prefix K/V the action expert
+    # cross-attends to with a single (or few) synthetic tokens whose K/V are
+    # produced from a low-dimensional projection of the pooled prefix. The
+    # action expert ends up "seeing" only this low-dim control vector instead
+    # of the full image+language sequence.
+    prefix_bottleneck: bool = False
+    prefix_bottleneck_dim: int = 5
+    prefix_bottleneck_num_tokens: int = 1
+    # Source of the pooled prefix that feeds the bottleneck:
+    #   "image_lang" → mean-pool over PaliGemma prefix tokens (image+language)
+    #   "lang_only"  → mean-pool over language tokens only
+    prefix_bottleneck_source: str = "image_lang"
+    prefix_bottleneck_hidden: int = 256
+    # Depth of the down projector (Linear count). Default 2 matches the
+    # original (Linear → GELU → Linear) architecture; bump to 3+ to deepen
+    # the projector (e.g. to match a wider/deeper router).
+    prefix_bottleneck_num_layers: int = 2
+    # Option (b): also bottleneck proprioceptive state. When True, the state
+    # is concatenated into the projector's input (so z encodes vision + lang
+    # + state) and the state token is REMOVED from the suffix — the action
+    # expert literally only sees actions+time as inputs and the 5-D z + chosen
+    # router idx as conditioning. Test of "expert as fully open-loop skill".
+    prefix_bottleneck_include_state: bool = False
+    # Residual state pathway: when ``include_state=True`` the state token is
+    # normally removed from the suffix (option-b). Setting this True keeps
+    # the state token in the suffix as a residual, so the action expert sees
+    # state via two channels — the pretrained suffix self-attention (calibrated
+    # at init) AND the synth K/V via z. Combined with ``zero_init_upkv``, the
+    # bottleneck path is silent at init and the policy is identical to the
+    # pretrained Pi0-with-state-token at step 0.
+    prefix_bottleneck_keep_state_token: bool = False
+    # Zero-initialise the final layer of every per-layer up_k / up_v MLP so
+    # that synth K/V ≡ 0 at init. This pairs with ``keep_state_token`` to give
+    # the policy a working starting point: residual state token feeds the
+    # pretrained pathway, bottleneck path contributes nothing until up_k/up_v
+    # learn nonzero values during training.
+    prefix_bottleneck_zero_init_upkv: bool = False
+    # Capacity of the per-layer up_k / up_v MLPs that synthesize the K/V the
+    # action expert reads in place of the real prefix. Default 1 keeps the
+    # original single-Linear behaviour. Set higher (e.g. 4) so the synth path
+    # can learn the calibrated K/V distribution the pretrained action expert
+    # was trained against — capacity here is the actual binding constraint
+    # in option-b, not the down-projector's bandwidth.
+    prefix_bottleneck_upkv_num_layers: int = 1
+    prefix_bottleneck_upkv_hidden: int = 256
+
+    # Policy input dropout (Run A: regularise the policy directly without a
+    # bottleneck). At training time, with probability ``policy_input_dropout``
+    # *per modality, per sample, independent rolls*, zero out:
+    #   * the state token's embedding in the suffix
+    #   * the image-patch positions in the prefix output (before cross-attn)
+    #   * the language-token positions in the prefix output
+    # Goal: experts learn to be robust to missing modalities → behave more
+    # like generic primitives without the broken bootstrap of a learned
+    # bottleneck. Has no effect at eval time. 0.0 disables.
+    policy_input_dropout: float = 0.0
+
     # Deprecated fields kept for backward compatibility with pretrained checkpoint configs.
     # These existed in earlier versions of the Pi0 config and are present in saved YAML files
     # (e.g. lerobot/pi0_base). They are unused by current code.

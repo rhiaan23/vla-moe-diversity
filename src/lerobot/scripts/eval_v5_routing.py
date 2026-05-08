@@ -64,14 +64,35 @@ _OUTPUT_DIR: Path | None = _output_dir_from_argv()
 _orig_run_one = lev.run_one
 
 
+def _find_router(pol):
+    """Walk the policy wrapper chain to find ``whole_expert_router``.
+
+    PEFT-wrapped policies have an extra layer of indirection: ``pol.model``
+    is the inner ``PI0Policy`` (not ``PI0Pytorch``) so
+    ``pol.model.whole_expert_router`` is None. Traverse via ``.model``
+    attributes until we find one that has the router.
+    """
+    seen = set()
+    cur = pol
+    for _ in range(6):
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        router = getattr(cur, "whole_expert_router", None)
+        if router is not None:
+            return router
+        cur = getattr(cur, "model", None)
+    return None
+
+
 def _patched_run_one(task_group, task_id, env, **kw):
     R.set_task(task_group, task_id)
     pol = kw["policy"]
     if not R.installed:
-        router = getattr(pol.model, "whole_expert_router", None)
+        router = _find_router(pol)
         if router is None:
             raise RuntimeError(
-                "policy.model.whole_expert_router is None — this script is for v5 (whole-expert) checkpoints only."
+                "Could not locate whole_expert_router on the policy — this script is for v5 (whole-expert) checkpoints only."
             )
         router.register_forward_hook(R.hook)
         R.installed = True

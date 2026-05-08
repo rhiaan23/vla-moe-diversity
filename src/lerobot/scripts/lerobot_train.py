@@ -15,6 +15,7 @@
 # limitations under the License.
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -249,6 +250,59 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    if getattr(cfg.policy, "freeze_action_expert", False):
+        n_frozen = 0
+        for n, p in policy.named_parameters():
+            if ("gemma_expert" in n or "discriminator" in n) and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+        if is_main_process:
+            logging.info("freeze_action_expert=True: froze %s gemma_expert/discriminator params", f"{n_frozen:,}")
+
+    if getattr(cfg.policy, "freeze_io_heads", False):
+        io_keys = (
+            "state_proj", "action_in_proj", "action_out_proj",
+            "action_time_mlp_in", "action_time_mlp_out",
+        )
+        n_frozen = 0
+        for n, p in policy.named_parameters():
+            # Skip names containing any of the protected substrings outside the
+            # IO heads themselves (none in the pi0 tree, but be defensive).
+            if any(h in n for h in io_keys) and p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+        if is_main_process:
+            logging.info("freeze_io_heads=True: froze %s IO-head params", f"{n_frozen:,}")
+
+    if is_main_process:
+        from collections import Counter
+        groups = Counter()
+        for n, p in policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "whole_expert_router" in n or n.endswith("router") or ".router." in n:
+                k = "router"
+            elif "lora_A" in n or "lora_B" in n:
+                k = "lora"
+            elif any(h in n for h in (
+                "state_proj", "action_in_proj", "action_out_proj",
+                "action_time_mlp_in", "action_time_mlp_out",
+            )):
+                k = "io_heads"
+            elif "discriminator" in n:
+                k = "discriminator"
+            else:
+                k = "other"
+            groups[k] += p.numel()
+        total = sum(p.numel() for p in policy.parameters())
+        trainable = sum(v for v in groups.values())
+        logging.info(
+            "Trainable params by group: %s (total trainable=%s, total=%s)",
+            dict(groups),
+            f"{trainable:,}",
+            f"{total:,}",
+        )
+
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
@@ -470,6 +524,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                # Opt-in rolling-checkpoint mode: delete prior checkpoint dirs
+                # BEFORE saving the new one, so peak disk usage stays at one
+                # checkpoint's worth instead of two. Gated by env var so other
+                # slurm scripts are unaffected. Tradeoff: if save fails, we
+                # lose the prior checkpoint too — acceptable since the next
+                # save attempt can reproduce it.
+                if os.environ.get("KEEP_ONLY_LAST_CHECKPOINT", "").lower() in ("1", "true", "yes"):
+                    import shutil
+
+                    if checkpoint_dir.parent.exists():
+                        for sibling in checkpoint_dir.parent.iterdir():
+                            if sibling.is_symlink():
+                                continue
+                            if sibling.resolve() == checkpoint_dir.resolve():
+                                continue
+                            shutil.rmtree(sibling, ignore_errors=True)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
